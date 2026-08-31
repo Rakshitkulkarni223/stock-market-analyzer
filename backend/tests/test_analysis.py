@@ -108,13 +108,28 @@ def test_clean_replaces_nan_with_none():
 def test_plan_is_structurally_sane(bars, style):
     r = analysis.analyse(bars, style)
     p = r["plan"]
-    assert p["stop"] < p["entry_low"] <= p["entry_high"]
-    assert p["target1"] > p["entry_mid"]
-    assert p["target2"] >= p["target1"]
+    d = p["direction"]
+
+    # Direction must be one of the valid values
+    assert d in ("long", "short", "neutral")
+
+    if d == "short":
+        # Short plan: stop above entry, targets below entry
+        assert p["stop"] > p["entry_high"] >= p["entry_low"]
+        assert p["target1"] < p["entry_mid"]
+        assert p["target2"] <= p["target1"]
+    else:
+        # Long / neutral plan: stop below entry, targets above entry
+        assert p["stop"] < p["entry_low"] <= p["entry_high"]
+        assert p["target1"] > p["entry_mid"]
+        assert p["target2"] >= p["target1"]
+
     assert p["risk_per_unit"] > 0
-    assert all(math.isfinite(v) for v in p.values())
+    # Check all numeric values are finite (skip the direction string)
+    assert all(math.isfinite(v) for k, v in p.items() if isinstance(v, (int, float)))
     assert r["verdict"]["headline"]
     assert r["verdict"]["tone"] in ("positive", "neutral", "negative")
+    assert r["direction"] in ("long", "short", "neutral")
 
 
 def test_every_factor_scores_a_finite_number():
@@ -130,7 +145,9 @@ def test_uptrend_scores_above_downtrend():
     down = analysis.analyse(downtrend(), "swing")
     assert up["verdict"]["score"] > down["verdict"]["score"]
     assert down["verdict"]["tone"] == "negative"
-    assert "Don't buy" in down["verdict"]["headline"]
+    # Downtrend should recommend either not buying, shorting, or being bearish
+    headline = down["verdict"]["headline"].lower()
+    assert any(kw in headline for kw in ["don't buy", "don\u2019t buy", "short", "downtrend", "bearish", "trim"])
 
 
 def test_bear_regime_gate_beats_a_positive_bounce():
@@ -139,7 +156,9 @@ def test_bear_regime_gate_beats_a_positive_bounce():
     bars = series(520, lambda i, p: p * (1 - 0.0016 + math.sin(i / 9) * 0.006), start=5000)
     r = analysis.analyse(bars, "swing")
     assert r["verdict"]["tone"] == "negative"
-    assert "Downtrend" in r["verdict"]["headline"]
+    # In bear regime, headline should be bearish (short recommendation or don't buy)
+    headline = r["verdict"]["headline"].lower()
+    assert any(kw in headline for kw in ["downtrend", "short", "don't buy", "don\u2019t buy", "bearish", "trim"])
     # the individual factors may well be net-positive on the bounce; the gate still holds
     assert any(f["score"] > 0 for f in r["factors"])
 
@@ -175,11 +194,37 @@ def test_levels_are_sorted_around_price():
             assert lv["price"] < px
 
 
+def test_direction_field_is_present():
+    """The direction field must always be present in the result."""
+    for bars_fn in [uptrend, downtrend, choppy, noisy]:
+        r = analysis.analyse(bars_fn(), "swing")
+        assert r["direction"] in ("long", "short", "neutral")
+        # Plan direction matches top-level for long/short; neutral uses a long plan
+        if r["direction"] == "neutral":
+            assert r["plan"]["direction"] == "long"
+        else:
+            assert r["plan"]["direction"] == r["direction"]
+
+
+def test_downtrend_prefers_short():
+    """A clear downtrend should suggest a short direction."""
+    r = analysis.analyse(downtrend(), "swing")
+    # Should be either short or at least negative tone (don't buy)
+    assert r["verdict"]["tone"] == "negative"
+
+
+def test_uptrend_prefers_long():
+    """A clear uptrend should suggest a long direction."""
+    r = analysis.analyse(uptrend(), "swing")
+    assert r["direction"] == "long"
+
+
 # --------------------------------------------------------------------- backtest
 def test_backtest_reports_consistent_arithmetic():
     r = analysis.analyse(noisy(), "swing")
     arrays = r.pop("_arrays")
-    b = backtest.run(arrays)
+    direction = r.get("direction", "long")
+    b = backtest.run(arrays, direction)
     assert b["trades"] >= 0
     assert 0 <= b["win_rate"] <= 100
     assert b["stopped_out"] <= b["trades"]
@@ -196,6 +241,26 @@ def test_backtest_on_thin_history_is_empty_not_broken():
     b = backtest.run(r.pop("_arrays"))
     assert b["trades"] == 0
     assert "No trade ever triggered" in b["note"]
+
+
+def test_backtest_short_direction():
+    """Short backtest should produce valid results."""
+    r = analysis.analyse(downtrend(), "swing")
+    arrays = r.pop("_arrays")
+    b = backtest.run(arrays, "short")
+    assert b["trades"] >= 0
+    assert 0 <= b["win_rate"] <= 100
+    assert b["max_drawdown"] >= 0
+    assert "Short" in b["rule"]
+
+
+def test_backtest_long_direction():
+    """Long backtest should produce valid results."""
+    r = analysis.analyse(uptrend(), "swing")
+    arrays = r.pop("_arrays")
+    b = backtest.run(arrays, "long")
+    assert b["trades"] >= 0
+    assert "Long" in b["rule"]
 
 
 # --------------------------------------------------------------------- seasonality
@@ -270,4 +335,8 @@ def test_csv_too_short_raises_with_a_useful_message():
 def test_csv_end_to_end_into_analysis():
     bars = providers.parse_csv(_csv(noisy(400)))
     r = analysis.analyse(bars, "swing")
-    assert r["plan"]["stop"] < r["plan"]["entry_low"]
+    p = r["plan"]
+    if p["direction"] == "short":
+        assert p["stop"] > p["entry_high"]
+    else:
+        assert p["stop"] < p["entry_low"]

@@ -6,7 +6,7 @@ GET  /api/health                     liveness
 GET  /api/universe                   the pickable asset catalog
 GET  /api/analyse                    analyse a catalog symbol (or any Yahoo ticker)
 POST /api/analyse/csv                analyse an uploaded CSV of daily bars
-POST /api/position-size              units to buy for a given stop and risk budget
+POST /api/position-size              units to buy/short for a given stop and risk budget
 POST /api/cache/clear                drop the price cache
 
 Everything is read-only. No orders are placed anywhere, ever.
@@ -53,40 +53,52 @@ DISCLAIMER = (
 # --------------------------------------------------------------------------- helpers
 def _assemble(bars: list[dict], style: str, label: str, currency: str,
               source: str, symbol: Optional[str]) -> dict:
-    result = analysis.analyse(bars, style)
-    arrays = result.pop("_arrays")
-    result["backtest"] = backtest.run(arrays)
-    result["seasonality"] = seasonality.run(bars)
-    result["asset"] = {
-        "name": label,
-        "symbol": symbol,
-        "currency": currency,
-        "currency_symbol": universe.CURRENCY_SYMBOL.get(currency, ""),
-        "source": source,
-        "first_bar": bars[0]["t"],
-        "last_bar": bars[-1]["t"],
-    }
-    result["disclaimer"] = DISCLAIMER
-    return result
+    try:
+        result = analysis.analyse(bars, style)
+        arrays = result.pop("_arrays")
+        direction = result.get("direction", "long")
+        result["backtest"] = backtest.run(arrays, direction)
+        result["seasonality"] = seasonality.run(bars)
+        result["asset"] = {
+            "name": label,
+            "symbol": symbol,
+            "currency": currency,
+            "currency_symbol": universe.CURRENCY_SYMBOL.get(currency, ""),
+            "source": source,
+            "first_bar": bars[0]["t"],
+            "last_bar": bars[-1]["t"],
+        }
+        result["disclaimer"] = DISCLAIMER
+        return result
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"Assembly failed: {exc}") from exc
 
 
 # --------------------------------------------------------------------------- routes
 @app.get("/api/health")
 def health() -> dict:
-    return {"ok": True, "cached_series": len(providers._cache)}
+    try:
+        return {"ok": True, "cached_series": len(providers._cache)}
+    except Exception:
+        return {"ok": False, "cached_series": 0}
 
 
 @app.get("/api/universe")
 def get_universe() -> dict:
-    return {
-        "categories": [{"name": cat, "assets": rows} for cat, rows in universe.UNIVERSE.items()],
-        "ranges": list(providers.VALID_RANGES),
-        "styles": [
-            {"id": "swing", "label": "Swing (days–weeks)"},
-            {"id": "position", "label": "Position (weeks–months)"},
-        ],
-        "disclaimer": DISCLAIMER,
-    }
+    try:
+        return {
+            "categories": [{"name": cat, "assets": rows} for cat, rows in universe.UNIVERSE.items()],
+            "ranges": list(providers.VALID_RANGES),
+            "styles": [
+                {"id": "swing", "label": "Swing (days\u2013weeks)"},
+                {"id": "position", "label": "Position (weeks\u2013months)"},
+            ],
+            "disclaimer": DISCLAIMER,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/api/analyse")
@@ -96,20 +108,25 @@ def analyse_symbol(
     style: str = Query("swing", pattern="^(swing|position)$"),
     source: Optional[str] = Query(None, pattern="^(yahoo|binance)$"),
 ) -> dict:
-    known = universe.lookup(symbol)
-    src = source or (known["source"] if known else "yahoo")
-    label = known["name"] if known else symbol
-    currency = known["currency"] if known else ("USD" if src == "binance" else "")
-
     try:
-        bars = providers.fetch(symbol, src, range)
-    except providers.DataError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        known = universe.lookup(symbol)
+        src = source or (known["source"] if known else "yahoo")
+        label = known["name"] if known else symbol
+        currency = known["currency"] if known else ("USD" if src == "binance" else "")
 
-    try:
-        return _assemble(bars, style, label, currency, src, symbol)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            bars = providers.fetch(symbol, src, range)
+        except providers.DataError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        try:
+            return _assemble(bars, style, label, currency, src, symbol)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/api/analyse/csv")
@@ -120,28 +137,33 @@ async def analyse_csv(
     label: str = Form("Imported series"),
     currency: str = Form(""),
 ) -> dict:
-    if style not in ("swing", "position"):
-        raise HTTPException(status_code=422, detail="style must be swing or position")
-
-    if file is not None:
-        raw = await file.read()
-        if len(raw) > 8_000_000:
-            raise HTTPException(status_code=413, detail="file larger than 8 MB")
-        try:
-            payload = raw.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            payload = raw.decode("latin-1")
-        label = label if label != "Imported series" else (file.filename or label)
-    elif text:
-        payload = text
-    else:
-        raise HTTPException(status_code=422, detail="send either a file or a text field")
-
     try:
-        bars = providers.parse_csv(payload)
-        return _assemble(bars, style, label, currency, "csv", None)
-    except (providers.DataError, ValueError) as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if style not in ("swing", "position"):
+            raise HTTPException(status_code=422, detail="style must be swing or position")
+
+        if file is not None:
+            raw = await file.read()
+            if len(raw) > 8_000_000:
+                raise HTTPException(status_code=413, detail="file larger than 8 MB")
+            try:
+                payload = raw.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                payload = raw.decode("latin-1")
+            label = label if label != "Imported series" else (file.filename or label)
+        elif text:
+            payload = text
+        else:
+            raise HTTPException(status_code=422, detail="send either a file or a text field")
+
+        try:
+            bars = providers.parse_csv(payload)
+            return _assemble(bars, style, label, currency, "csv", None)
+        except (providers.DataError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 class SizeRequest(BaseModel):
@@ -150,51 +172,80 @@ class SizeRequest(BaseModel):
     entry: float = Field(gt=0)
     stop: float = Field(gt=0)
     target: Optional[float] = Field(None, gt=0)
+    direction: str = Field("long", description="long or short")
 
 
 @app.post("/api/position-size")
 def position_size(req: SizeRequest) -> dict:
-    per_unit = req.entry - req.stop
-    if per_unit <= 0:
-        raise HTTPException(status_code=422, detail="the stop must sit below the entry price")
+    try:
+        is_short = req.direction == "short"
 
-    budget = req.capital * req.risk_pct / 100
-    units = int(budget // per_unit)
-    value = units * req.entry
-    share = value / req.capital if req.capital else 0.0
+        if is_short:
+            # Short: stop is above entry, risk = stop - entry
+            per_unit = req.stop - req.entry
+            if per_unit <= 0:
+                raise HTTPException(status_code=422,
+                                    detail="for a short, the stop must sit above the entry price")
+        else:
+            # Long: stop is below entry, risk = entry - stop
+            per_unit = req.entry - req.stop
+            if per_unit <= 0:
+                raise HTTPException(status_code=422,
+                                    detail="for a long, the stop must sit below the entry price")
 
-    # The account size at which one unit fits inside the chosen risk budget.
-    # Useful when the answer is zero: it says what would have to change.
-    min_capital = per_unit / (req.risk_pct / 100)
+        budget = req.capital * req.risk_pct / 100
+        units = int(budget // per_unit)
+        value = units * req.entry
+        share = value / req.capital if req.capital else 0.0
 
-    warning = None
-    if units <= 0:
-        warning = (f"One unit risks {per_unit:,.2f}, which is more than your whole risk budget of "
-                   f"{budget:,.2f}. At {req.risk_pct:g}% risk you would need about "
-                   f"{min_capital:,.0f} of capital to take even one unit. Use a cheaper proxy for "
-                   "the same exposure (an ETF, or a smaller-lot instrument), widen your risk "
-                   "percentage knowingly, or skip the trade — do not just buy one anyway.")
-    elif share > 0.35:
-        warning = (f"That position is {share * 100:.0f}% of your capital in one name. The maths "
-                   "says the loss is capped, but a gap through your stop overnight would not be. "
-                   "Consider halving it.")
-    elif share > 0.20:
-        warning = (f"Note: {share * 100:.0f}% of capital in a single position. Fine if it is one "
-                   "of a few, dangerous if it is one of two.")
+        # The account size at which one unit fits inside the chosen risk budget.
+        min_capital = per_unit / (req.risk_pct / 100)
 
-    return {
-        "units": units,
-        "position_value": round(value, 2),
-        "capital_share_pct": round(share * 100, 2),
-        "risk_per_unit": round(per_unit, 4),
-        "loss_if_stopped": round(units * per_unit, 2),
-        "loss_pct_of_capital": round(units * per_unit / req.capital * 100, 3) if req.capital else 0,
-        "gain_if_target": round(units * (req.target - req.entry), 2) if req.target else None,
-        "min_capital_for_one_unit": round(min_capital, 2),
-        "warning": warning,
-    }
+        # Calculate gain if target hit
+        gain_if_target = None
+        if req.target:
+            if is_short:
+                gain_if_target = round(units * (req.entry - req.target), 2)
+            else:
+                gain_if_target = round(units * (req.target - req.entry), 2)
+
+        warning = None
+        action_word = "short" if is_short else "buy"
+        if units <= 0:
+            warning = (f"One unit risks {per_unit:,.2f}, which is more than your whole risk budget of "
+                       f"{budget:,.2f}. At {req.risk_pct:g}% risk you would need about "
+                       f"{min_capital:,.0f} of capital to take even one unit. Use a cheaper proxy for "
+                       f"the same exposure, widen your risk percentage knowingly, or skip the trade "
+                       f"\u2014 do not just {action_word} one anyway.")
+        elif share > 0.35:
+            warning = (f"That position is {share * 100:.0f}% of your capital in one name. The maths "
+                       "says the loss is capped, but a gap through your stop overnight would not be. "
+                       "Consider halving it.")
+        elif share > 0.20:
+            warning = (f"Note: {share * 100:.0f}% of capital in a single position. Fine if it is one "
+                       "of a few, dangerous if it is one of two.")
+
+        return {
+            "units": units,
+            "position_value": round(value, 2),
+            "capital_share_pct": round(share * 100, 2),
+            "risk_per_unit": round(per_unit, 4),
+            "loss_if_stopped": round(units * per_unit, 2),
+            "loss_pct_of_capital": round(units * per_unit / req.capital * 100, 3) if req.capital else 0,
+            "gain_if_target": gain_if_target,
+            "min_capital_for_one_unit": round(min_capital, 2),
+            "direction": req.direction,
+            "warning": warning,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/api/cache/clear")
 def clear_cache() -> dict:
-    return {"cleared": providers.cache_clear()}
+    try:
+        return {"cleared": providers.cache_clear()}
+    except Exception:
+        return {"cleared": 0}
