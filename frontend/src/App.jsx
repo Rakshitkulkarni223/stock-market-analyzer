@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { analyse, analyseCsv, getUniverse } from './api';
-import AssetPicker from './components/AssetPicker';
 import BacktestPanel from './components/BacktestPanel';
 import IndicatorTable from './components/IndicatorTable';
 import LevelsTable from './components/LevelsTable';
@@ -11,6 +10,7 @@ import PriceChart from './components/PriceChart';
 import RiskLadder from './components/RiskLadder';
 import Seasonality from './components/Seasonality';
 import Ticker from './components/Ticker';
+import TopBar from './components/TopBar';
 
 export default function App() {
   const [universe, setUniverse] = useState(null);
@@ -135,42 +135,26 @@ export default function App() {
   };
 
   return (
-    <div className="wrap">
-      <header className="masthead">
-        <h1>Know the downside before you look at the upside.</h1>
-        <p>
-          Pick a market. This reads its price history and hands you three numbers that matter: where
-          to buy, where you get out if you&rsquo;re wrong, and how many units keep that mistake
-          survivable.
-        </p>
-        <div className="caution">
-          No tool can promise you won&rsquo;t lose money &mdash; anyone who says otherwise is selling
-          something. What a plan can do is cap the loss on any single trade to an amount you chose in
-          advance.
-        </div>
-      </header>
+    <div className="app-shell">
+      <TopBar
+        universe={universe}
+        selected={selected}
+        onSelect={onSelect}
+        range={range}
+        setRange={onRange}
+        style={style}
+        setStyle={onStyle}
+        onRun={() => runSymbol(selected)}
+        onCsv={runCsv}
+        loading={loading}
+        status={status}
+      />
 
-      <div className="desk">
-        <aside className="rail">
-          <AssetPicker
-            universe={universe}
-            selected={selected}
-            onSelect={onSelect}
-            range={range}
-            setRange={onRange}
-            style={style}
-            setStyle={onStyle}
-            onRun={() => runSymbol(selected)}
-            onCsv={runCsv}
-            loading={loading}
-            status={status}
-          />
-        </aside>
-
+      <div className="wrap">
         <main>
           {!result ? (
             <div className="empty">
-              Pick a market on the left and press Analyse to get started.
+              Click the market name above and pick an asset to get started.
             </div>
           ) : (
             <>
@@ -183,26 +167,29 @@ export default function App() {
               )}
 
               <Ticker result={result} />
-              <RiskLadder result={result} />
-
-              <div className="section-divider">Price Action</div>
-              <PriceChart result={result} />
-
-              <div className="section-divider">Position & Analysis</div>
-              <div className="cols">
-                <PositionSizer result={result} />
-                <IndicatorTable factors={result.factors} />
+              <div className="dashboard-grid">
+                <div className="main-col">
+                  <RiskLadder result={result} />
+                  <PriceChart result={result} />
+                </div>
+                <div className="side-rail">
+                  <PositionSizer result={result} />
+                </div>
               </div>
 
-              <div className="section-divider">Historical Performance</div>
+              <IndicatorTable factors={result.factors} />
+
+              <div className="section-divider">Track record</div>
               <div className="cols">
                 <BacktestPanel backtest={result.backtest} bars={result.meta.bars} />
                 <Seasonality seasonality={result.seasonality} />
               </div>
 
-              <div className="section-divider">Key Levels</div>
-              <LevelsTable levels={result.levels} />
-              <Limits />
+              <div className="section-divider">Levels &amp; limits</div>
+              <div className="cols">
+                <LevelsTable levels={result.levels} />
+                <Limits />
+              </div>
             </>
           )}
 
